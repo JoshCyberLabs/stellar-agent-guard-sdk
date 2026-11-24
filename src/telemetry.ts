@@ -1753,10 +1753,8 @@ export class GuardDecisionCounters {
       // Unknown reason symbols (outside the contract's vocabulary) are bucketed
       // into "unknown" so cardinality is bounded: only the known set plus one
       // extra key can appear, regardless of what an adversarial RPC sends.
-      const reasonKey =
-        reason !== null ? (isGuardReason(reason) ? reason : "unknown") : null;
-      if (reasonKey !== null)
-        this.byReason.set(reasonKey, (this.byReason.get(reasonKey) ?? 0) + 1);
+      const reasonKey = reason !== null ? (isGuardReason(reason) ? reason : "unknown") : null;
+      if (reasonKey !== null) this.byReason.set(reasonKey, (this.byReason.get(reasonKey) ?? 0) + 1);
     }
     this.evict();
   }

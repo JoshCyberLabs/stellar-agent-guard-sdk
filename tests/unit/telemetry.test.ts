@@ -2004,7 +2004,11 @@ describe("stats() byReason unknown bucket (#433)", () => {
       ledgerClosedAt: null,
       observedAt: null,
       transactionHash: null,
-      decision: { result, reason: reason as never, source: stream === "committed" ? "ledger" : "diagnostic" },
+      decision: {
+        result,
+        reason: reason as never,
+        source: stream === "committed" ? "ledger" : "diagnostic",
+      },
       data: null,
     };
   }
