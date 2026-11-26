@@ -35,9 +35,15 @@
  * it was never allowed.
  */
 import { resolveLogger, type GuardLogger, type GuardLoggerInput } from "./logger.ts";
-import { SorobanDataBuilder, scValToNative, type rpc, type xdr } from "@stellar/stellar-sdk";
-import { InvalidFeeCeilingError, InvalidInputError } from "./errors.ts";
-import { INCLUSION_FEE } from "./tx.ts";
+import {
+  SorobanDataBuilder,
+  scValToNative,
+  type Transaction,
+  type rpc,
+  type xdr,
+} from "@stellar/stellar-sdk";
+import { ContractResponseError, InvalidFeeCeilingError, InvalidInputError } from "./errors.ts";
+import { INCLUSION_FEE, normalizeFeeStroops, parseSimulationResourceFee } from "./tx.ts";
 import type { PreFlightDecision, PreFlightInterceptor } from "./preflight.ts";
 import type { ContractCall } from "./tx.ts";
 import type { PolicyConfig } from "./policy.ts";
@@ -224,15 +230,18 @@ interface ResolvedFeePricing {
  * Validate a fee ceiling without collapsing "omitted" into "zero".
  *
  * Only `undefined` means "no ceiling"; a caller that passes `0n` has chosen a
- * real, maximally strict policy and it must survive. Anything that is not a
- * non-negative `bigint` — including a `number`, a numeric string or `null` — is
- * rejected with a typed input error before any simulation runs.
+ * real, maximally strict policy and it must survive. `bigint` and base-10
+ * integer strings normalize to the same internal value; every other type and
+ * malformed or out-of-range value is rejected before simulation.
  */
 function validateFeeCeiling(value: unknown, field = "maxFeeStroops"): bigint {
-  if (typeof value !== "bigint" || value < 0n) {
+  if (typeof value === "bigint" && value < 0n) {
     throw new InvalidFeeCeilingError(field, value);
   }
-  return value;
+  if (typeof value !== "bigint" && typeof value !== "string") {
+    throw new InvalidFeeCeilingError(field, value);
+  }
+  return normalizeFeeStroops(value, field, true);
 }
 
 /**
@@ -447,8 +456,9 @@ export interface CostPreCheckConfig {
   interceptor: Pick<PreFlightInterceptor, "check">;
   /**
    * Refuse (as `over_budget`) when the estimated *total* fee exceeds this many
-   * stroops. Must be a non-negative `bigint`; a negative, `number`, string or
-   * other value throws `InvalidFeeCeilingError` at construction.
+   * stroops. Accepts a non-negative `bigint` or base-10 integer string up to
+   * the Stellar u64 fee limit. Malformed strings and out-of-range values throw
+   * `InvalidInputError` at construction.
    *
    * Omitted means "price it, never object to the price". `0n` is a real
    * ceiling, distinct from omission: every quoted total (which includes the
@@ -456,7 +466,13 @@ export interface CostPreCheckConfig {
    *
    * Default: none (no ceiling).
    */
-  maxFeeStroops?: bigint | undefined;
+  maxFeeStroops?: bigint | string | undefined;
+  /**
+   * Optional transport settings used by `checkTransaction()`. The passphrase
+   * is required for every transaction quote; the server is required only when
+   * no simulation response is supplied.
+   */
+  networkPassphrase?: string | undefined;
   /**
    * Optional log sink for this pre-checker's decision points: the priced verdict
    * and whether the ceiling was exceeded.
@@ -518,8 +534,9 @@ export interface CostPreCheckConfig {
    */
   percentile?: FeePercentile | undefined;
   /**
-   * RPC server used to read fee stats in `"rpc"` mode. Supply this or
-   * `feeStats`; neither is needed in `"fixed"` mode.
+   * RPC server used to simulate transactions in `checkTransaction()` and to
+   * read fee stats in `"rpc"` mode. Supply this or `feeStats` for `"rpc"`
+   * pricing; transaction checks can instead receive a simulation response.
    */
   server?: rpc.Server | undefined;
   /**
@@ -571,6 +588,8 @@ export interface CostProvenance {
    * `null` when neither source established a usable sequence.
    */
   ledger: number | null;
+  /** Input path that produced this quote; absent on legacy provenance. */
+  source?: "call" | "transaction" | undefined;
   /** Which observation supplied `ledger`; `"simulation"` when omitted. */
   ledgerSource?: "simulation" | "fee_stats" | undefined;
   /**
@@ -589,6 +608,13 @@ export interface CostProvenance {
    */
   fallbackReason?: string | undefined;
 }
+
+/** Transaction provenance records its input path even when no ledger was returned. */
+export interface TransactionCostProvenance extends CostProvenance {
+  source: "transaction";
+}
+
+export type CostDecisionProvenance = CostProvenance | TransactionCostProvenance;
 
 export type CostDecision =
   | ({
@@ -613,7 +639,7 @@ export type CostDecision =
       /** Additive policy-relative context when a policy source is configured; null otherwise. */
       policyContext: PolicyContext | null;
       /** Ledger snapshot this quote describes, or `null` when it was unavailable. */
-      provenance: CostProvenance | null;
+      provenance: CostDecisionProvenance | null;
     } & FeeBreakdown &
       CostResultBreakdown)
   | ({
@@ -632,7 +658,7 @@ export type CostDecision =
       headroomWarning: null;
       policyContext: PolicyContext | null;
       /** Ledger snapshot this quote describes, or `null` when it was unavailable. */
-      provenance: CostProvenance | null;
+      provenance: CostDecisionProvenance | null;
     } & FeeBreakdown &
       CostResultBreakdown)
   | ({
@@ -652,7 +678,7 @@ export type CostDecision =
       headroomWarning: null;
       policyContext: PolicyContext | null;
       /** A refusal is not simulation-priced, so there is no ledger provenance. */
-      provenance: CostProvenance | null;
+      provenance: CostDecisionProvenance | null;
     } & CostResultBreakdown)
   | ({
       kind: "undetermined";
@@ -668,7 +694,7 @@ export type CostDecision =
       headroomWarning: null;
       policyContext: PolicyContext | null;
       /** No usable simulation means no ledger provenance. */
-      provenance: CostProvenance | null;
+      provenance: CostDecisionProvenance | null;
     } & CostResultBreakdown);
 
 /** Type alias matching documentation nomenclature. */
@@ -690,11 +716,12 @@ export interface CostPreCheckOptions {
   policy?: string | PolicyConfig | null | undefined;
   /**
    * Override the fee ceiling in stroops for this check. Must be a non-negative
-   * `bigint`; invalid values throw `InvalidFeeCeilingError` before the
-   * interceptor is called. `0n` is a real ceiling, distinct from omission.
+   * `bigint` or a base-10 integer string; invalid values throw
+   * `InvalidInputError` before the interceptor is called. `0n` / `"0"` is a
+   * real ceiling, distinct from omission.
    * Default: the configured `CostPreCheckConfig.maxFeeStroops`.
    */
-  maxFeeStroops?: bigint | undefined;
+  maxFeeStroops?: bigint | string | undefined;
   /**
    * Per-call override of the configured window-spend snapshot (issue #311).
    * An explicit `null` clears a configured snapshot for this check; omitting
@@ -716,6 +743,14 @@ export interface CostPreCheckOptions {
    * Default: `DEFAULT_RPC_TIMEOUT_MS` (30 000 ms), applied by the interceptor.
    */
   timeoutMs?: number | undefined;
+}
+
+/** Per-transaction controls for `checkTransaction()`. */
+export interface CostTransactionCheckOptions {
+  /** A simulation response already produced for this exact transaction. */
+  simulation?: rpc.Api.SimulateTransactionResponse | undefined;
+  /** Override the configured ceiling for this quote. */
+  maxFeeStroops?: bigint | string | undefined;
 }
 
 /**
@@ -780,6 +815,7 @@ export function describeCostDecision(
         surplusStroops?: bigint | null | undefined;
         headroomWarning?: HeadroomWarning | null | undefined;
         reason?: string | undefined;
+        cause?: string | undefined;
         policyContext?: PolicyContext | null | undefined;
       },
 ): string {
@@ -1157,6 +1193,163 @@ export class CostPreChecker {
   }
 
   /**
+   * Price the exact fee on a Stellar SDK transaction against its simulated
+   * minimum resource fee. This does not run the guard interceptor or broadcast.
+   */
+  async checkTransaction(
+    transaction: Transaction,
+    options?: CostTransactionCheckOptions,
+  ): Promise<CostDecision> {
+    const ceiling =
+      options?.maxFeeStroops !== undefined
+        ? validateFeeCeiling(options.maxFeeStroops)
+        : (this.maxFeeStroops ?? null);
+    if (
+      typeof transaction !== "object" ||
+      transaction === null ||
+      typeof transaction.networkPassphrase !== "string" ||
+      typeof transaction.toXDR !== "function"
+    ) {
+      throw new InvalidInputError(
+        "transaction",
+        "stellar_transaction",
+        "expected a Stellar SDK Transaction instance",
+      );
+    }
+    const networkPassphrase = this.config.networkPassphrase;
+    if (networkPassphrase === undefined) {
+      throw new InvalidInputError(
+        "networkPassphrase",
+        "required",
+        "set the transaction checker's network passphrase",
+      );
+    }
+    if (transaction.networkPassphrase !== networkPassphrase) {
+      throw new InvalidInputError(
+        "transaction.networkPassphrase",
+        "matches_checker_network",
+        `transaction was built for ${JSON.stringify(transaction.networkPassphrase)}, not the checker's configured network`,
+      );
+    }
+    const transactionFee = normalizeFeeStroops(transaction.fee, "transaction.fee", true);
+    let simulation = options?.simulation;
+    if (simulation === undefined) {
+      if (this.config.server === undefined) {
+        throw new InvalidInputError(
+          "server",
+          "required",
+          "configure an RPC server or supply the transaction's simulation response",
+        );
+      }
+      simulation = await this.config.server.simulateTransaction(transaction);
+    }
+    if (typeof simulation !== "object" || simulation === null) {
+      throw new InvalidInputError(
+        "simulation",
+        "simulation_response",
+        "expected a Stellar RPC simulation response",
+      );
+    }
+
+    if ("error" in simulation) {
+      return this.logTransactionCost(
+        this.costOf(
+          { allowed: false, kind: "undetermined", detail: "transaction simulation failed" },
+          null,
+          ceiling,
+          { inclusionFeeStroops: 0n, feeSource: "fixed", attemptedRpc: false },
+          "transaction",
+        ),
+      );
+    }
+
+    let resourceFee: bigint;
+    try {
+      resourceFee = parseSimulationResourceFee(simulation.minResourceFee, { stage: "cost" });
+    } catch (error) {
+      if (!(error instanceof ContractResponseError)) throw error;
+      return this.logTransactionCost(
+        this.costOf(
+          {
+            allowed: false,
+            kind: "undetermined",
+            detail: "transaction simulation returned an invalid resource fee",
+          },
+          null,
+          ceiling,
+          { inclusionFeeStroops: 0n, feeSource: "fixed", attemptedRpc: false },
+          "transaction",
+        ),
+      );
+    }
+
+    const rawLedger: unknown = simulation.latestLedger;
+    const ledger =
+      typeof rawLedger === "number" && Number.isSafeInteger(rawLedger) && rawLedger >= 0
+        ? rawLedger
+        : null;
+    const breakdown = resourceBreakdownFromSimulation(simulation);
+    if (transactionFee < resourceFee) {
+      return this.logTransactionCost(
+        this.costOf(
+          {
+            allowed: false,
+            kind: "undetermined",
+            detail: "transaction fee is below the simulated minimum resource fee",
+          },
+          null,
+          ceiling,
+          { inclusionFeeStroops: 0n, feeSource: "fixed", attemptedRpc: false },
+          "transaction",
+        ),
+      );
+    }
+
+    const decision: PreFlightDecision = {
+      allowed: true,
+      kind: "admissible",
+      estimatedResourceFee: resourceFee,
+      footprintKeys: breakdown?.storageEntries ?? 0,
+      ...(breakdown ? { resourceBreakdown: breakdown } : {}),
+    };
+    const fees: FeeBreakdown = {
+      resourceFeeStroops: resourceFee,
+      inclusionFeeStroops: transactionFee - resourceFee,
+      totalFeeStroops: transactionFee,
+    };
+    const cost = this.costOf(
+      decision,
+      null,
+      ceiling,
+      { inclusionFeeStroops: fees.inclusionFeeStroops, feeSource: "fixed", attemptedRpc: false },
+      "transaction",
+      ledger,
+      fees,
+    );
+    return this.logTransactionCost(cost);
+  }
+
+  private logTransactionCost(cost: CostDecision): CostDecision {
+    if (cost.kind === "over_budget") {
+      this.logger.warn(`transaction exceeds the fee ceiling: ${describeCostDecision(cost)}`, {
+        totalFeeStroops: cost.totalFeeStroops.toString(),
+        feeCeilingStroops: cost.feeCeilingStroops.toString(),
+      });
+    } else if (cost.kind === "within_budget" && cost.headroomWarning !== null) {
+      this.logger.warn(`transaction is close to the fee ceiling: ${describeCostDecision(cost)}`, {
+        totalFeeStroops: cost.totalFeeStroops.toString(),
+        feeCeilingStroops: cost.feeCeilingStroops?.toString() ?? "none",
+        surplusStroops: cost.surplusStroops?.toString() ?? "unknown",
+      });
+    } else if (cost.kind === "undetermined") {
+      this.logger.warn(`transaction could not be priced: ${cost.detail}`);
+    } else {
+      this.logger.debug(describeCostDecision(cost));
+    }
+    return cost;
+  }
+
+  /**
    * Resolve the inclusion fee for one priced check (issue #445).
    *
    * `"fixed"` is pure and offline. `"rpc"` reads fee stats exactly once and
@@ -1267,12 +1460,30 @@ export class CostPreChecker {
     policyContext: PolicyContext | null,
     ceiling: bigint | null,
     pricing: ResolvedFeePricing,
+    source: "call" | "transaction" = "call",
+    ledgerOverride?: number | null,
+    feesOverride?: FeeBreakdown,
   ): CostDecision {
     // Provenance travels with the verdict from the same simulation, plus the fee
     // source in `"rpc"` mode. A block or an undetermined run has no priced
     // snapshot, so it is explicitly null rather than an invented ledger marker.
     const provenance =
-      decision.kind === "admissible" ? this.provenanceFor(decision, pricing) : null;
+      decision.kind === "admissible"
+        ? source === "transaction"
+          ? {
+              ledger:
+                ledgerOverride === undefined
+                  ? (decision.provenance?.ledger ?? null)
+                  : ledgerOverride,
+              source,
+            }
+          : (() => {
+              const callProvenance = this.provenanceFor(decision, pricing);
+              return callProvenance ? { ...callProvenance, source } : null;
+            })()
+        : source === "transaction"
+          ? { ledger: null, source }
+          : null;
     if (decision.kind === "blocked") {
       return {
         kind: "blocked",
@@ -1304,7 +1515,8 @@ export class CostPreChecker {
       };
     }
 
-    const fees = feeBreakdown(decision.estimatedResourceFee, pricing.inclusionFeeStroops);
+    const fees =
+      feesOverride ?? feeBreakdown(decision.estimatedResourceFee, pricing.inclusionFeeStroops);
     if (exceedsCeiling(fees.totalFeeStroops, ceiling)) {
       return {
         kind: "over_budget",

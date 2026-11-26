@@ -10,7 +10,15 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
-import { SorobanDataBuilder, nativeToScVal } from "@stellar/stellar-sdk";
+import {
+  Account,
+  Operation,
+  SorobanDataBuilder,
+  TransactionBuilder,
+  nativeToScVal,
+  type Transaction,
+  type rpc,
+} from "@stellar/stellar-sdk";
 import {
   CostPreChecker,
   STROOPS_PER_XLM,
@@ -22,6 +30,7 @@ import {
   precheckCostWithDecision,
   resourceBreakdownFromSimulation,
   type CostProvenance,
+  type CostTransactionCheckOptions,
   type PolicyContext,
   type ResourceBreakdown,
   type WindowSpendSnapshot,
@@ -32,12 +41,21 @@ import { unsafeContractAddress } from "../../src/policy.ts";
 import type { PreFlightDecision } from "../../src/preflight.ts";
 import type { ContractCall } from "../../src/tx.ts";
 import type { PolicyConfig } from "../../src/policy.ts";
+import { mulberry32, randomUint } from "./seeded-random.ts";
 
 const CALL: ContractCall = {
   contract: unsafeContractAddress("C".padEnd(56, "A")),
   fn: "transfer",
   args: [],
 };
+const NETWORK_PASSPHRASE = "Test SDF Network ; September 2015";
+const TRANSACTION = new TransactionBuilder(
+  new Account("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", "1"),
+  { fee: "2100", networkPassphrase: NETWORK_PASSPHRASE },
+)
+  .addOperation(Operation.manageData({ name: "cost-test", value: "fixture" }))
+  .setTimeout(0)
+  .build();
 const RECORDED_RESOURCE_PAYLOAD = JSON.parse(
   readFileSync(new URL("../fixtures/simulation-resource-payload.json", import.meta.url), "utf8"),
 ) as unknown;
@@ -164,7 +182,7 @@ describe("exceedsCeiling", () => {
   });
 
   it("rejects a malformed ceiling instead of letting a comparison decide", () => {
-    for (const bad of [-1n, 100, "100", 1.5]) {
+    for (const bad of [-1n, 100, 1.5]) {
       assert.throws(
         () => exceedsCeiling(1n, bad as unknown as bigint),
         InvalidFeeCeilingError,
@@ -175,6 +193,39 @@ describe("exceedsCeiling", () => {
 });
 
 describe("CostPreChecker fee ceiling validation (#345)", () => {
+  it("accepts base-10 integer fee ceilings and normalizes them to bigint", async () => {
+    const checker = new CostPreChecker({
+      interceptor: fakeInterceptor(admissible(49_900n)),
+      maxFeeStroops: "50000",
+    });
+    const decision = await checker.check(CALL);
+    assert.equal(decision.kind, "within_budget");
+    assert.equal(decision.feeCeilingStroops, 50_000n);
+    const callOverrideDecision = await new CostPreChecker({
+      interceptor: fakeInterceptor(admissible(49_900n)),
+    }).check(CALL, { maxFeeStroops: "50000" });
+    assert.equal(callOverrideDecision.kind, "within_budget");
+    assert.equal(callOverrideDecision.feeCeilingStroops, 50_000n);
+  });
+
+  it("rejects malformed or out-of-range fee strings with an input error", () => {
+    for (const bad of ["5e4", "1.5", "-1", " 1", "18446744073709551616"]) {
+      assert.throws(
+        () =>
+          new CostPreChecker({
+            interceptor: fakeInterceptor(admissible(1n)),
+            maxFeeStroops: bad,
+          }),
+        (error: unknown) => {
+          assert(error instanceof InvalidInputError);
+          assert.equal(error.field, "maxFeeStroops");
+          assert.match(error.message, new RegExp(bad.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+          return true;
+        },
+      );
+    }
+  });
+
   it("rejects a negative configured ceiling at construction", () => {
     assert.throws(
       () =>
@@ -195,7 +246,7 @@ describe("CostPreChecker fee ceiling validation (#345)", () => {
   });
 
   it("rejects non-bigint configured ceilings, including numbers and strings", () => {
-    for (const bad of [0, "0", null, 1.5]) {
+    for (const bad of [0, null, 1.5]) {
       assert.throws(
         () =>
           new CostPreChecker({
@@ -302,8 +353,11 @@ describe("CostPreChecker", () => {
     const decision = await checker.check(CALL);
 
     assert.equal(decision.kind, "within_budget");
-    assert.deepEqual(decision.provenance, { ledger: 512_345 });
-    assert.deepEqual(JSON.parse(JSON.stringify(decision.provenance)), { ledger: 512_345 });
+    assert.deepEqual(decision.provenance, { ledger: 512_345, source: "call" });
+    assert.deepEqual(JSON.parse(JSON.stringify(decision.provenance)), {
+      ledger: 512_345,
+      source: "call",
+    });
   });
 
   it("reports null provenance when the simulation did not establish a ledger", async () => {
@@ -376,6 +430,71 @@ describe("CostPreChecker", () => {
 });
 
 describe("describeCostDecision", () => {
+  it("has stable golden output for each decision kind without leaking context", () => {
+    const sensitiveAddress = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+    const sensitiveXdr = "AAAAAgAAAAB";
+    const context: PolicyContext = {
+      perTxCapOk: null,
+      windowRemainingEstimate: null,
+      reason: sensitiveAddress,
+    };
+    const cases = [
+      {
+        kind: "within_budget" as const,
+        allowed: true,
+        resourceFeeStroops: 2_000n,
+        inclusionFeeStroops: 100n,
+        totalFeeStroops: 2_100n,
+        footprintKeys: 3,
+        feeCeilingStroops: null,
+        policyContext: context,
+        expected:
+          "within budget: 2100 stroops (2000 resource + 100 inclusion), no ceiling, surplus unknown",
+      },
+      {
+        kind: "over_budget" as const,
+        allowed: false,
+        resourceFeeStroops: 2_000n,
+        inclusionFeeStroops: 100n,
+        totalFeeStroops: 2_100n,
+        footprintKeys: 3,
+        feeCeilingStroops: 2_000n,
+        policyContext: undefined,
+        expected: "over budget: 2100 stroops exceeds ceiling 2000, surplus unknown",
+      },
+      {
+        kind: "blocked" as const,
+        allowed: false,
+        reason: "recipient_not_allowed",
+        explanation: "not allowlisted",
+        detail: sensitiveXdr,
+        resourceFeeStroops: 0n,
+        inclusionFeeStroops: 0n,
+        totalFeeStroops: 0n,
+        policyContext: null,
+        expected: "blocked before broadcast (recipient_not_allowed): 0 stroops charged",
+      },
+      {
+        kind: "undetermined" as const,
+        allowed: false,
+        detail: sensitiveXdr,
+        cause: "rpc_failed",
+        resourceFeeStroops: 0n,
+        inclusionFeeStroops: 0n,
+        totalFeeStroops: 0n,
+        policyContext: null,
+        expected: "undetermined: not priced, not executed",
+      },
+    ];
+
+    for (const { expected, ...decision } of cases) {
+      const text = describeCostDecision(decision);
+      assert.equal(text, expected, `golden output for ${decision.kind}`);
+      assert(!text.includes(sensitiveAddress));
+      assert(!text.includes(sensitiveXdr));
+    }
+  });
+
   it("renders both fee components rather than a single opaque total", () => {
     const text = describeCostDecision({
       kind: "within_budget",
@@ -391,26 +510,126 @@ describe("describeCostDecision", () => {
     assert.match(text, /100 inclusion/);
     assert.match(text, /no ceiling/);
   });
-
-  it("states that a blocked call was not charged", () => {
-    const text = describeCostDecision({
-      kind: "blocked",
-      allowed: false,
-      reason: "recipient_not_allowed",
-      explanation: "not allowlisted",
-      detail: "simulation failed",
-      resourceFeeStroops: 0n,
-      inclusionFeeStroops: 0n,
-      totalFeeStroops: 0n,
-    });
-    assert.match(text, /recipient_not_allowed/);
-    assert.match(text, /0 stroops charged/);
-  });
 });
 
 describe("formatFee", () => {
   it("pins XLM's 7-decimal definition as an exact integer", () => {
     assert.equal(STROOPS_PER_XLM, 10_000_000n);
+  });
+
+  describe("fee arithmetic properties (#451)", () => {
+    it("preserves fee identities, ceiling decisions, and format round-trips for a seeded sample", () => {
+      const seed = 0x5eed451;
+      const rand = mulberry32(seed);
+      for (let index = 0; index < 1_000; index += 1) {
+        const resource = randomUint(rand, 63);
+        const ceiling = randomUint(rand, 64);
+        const fee = feeBreakdown(resource);
+        const context = `seed=${seed} case=${index} resource=${resource} ceiling=${ceiling}`;
+        assert.equal(
+          fee.totalFeeStroops,
+          fee.resourceFeeStroops + fee.inclusionFeeStroops,
+          context,
+        );
+        assert(fee.totalFeeStroops >= 0n, context);
+        assert.equal(
+          exceedsCeiling(fee.totalFeeStroops, ceiling),
+          fee.totalFeeStroops > ceiling,
+          context,
+        );
+
+        const rendered = formatFee(fee.totalFeeStroops);
+        const [whole = "", fraction = ""] = rendered.split(".");
+        const parsed =
+          BigInt(whole) * STROOPS_PER_XLM +
+          (fraction === "" ? 0n : BigInt(fraction.padEnd(7, "0")));
+        assert.equal(parsed, fee.totalFeeStroops, `${context} formatted=${rendered}`);
+      }
+    });
+  });
+
+  describe("CostPreChecker.checkTransaction (#450)", () => {
+    const simulation = {
+      minResourceFee: "2000",
+      latestLedger: 512_345,
+      transactionData: new SorobanDataBuilder().setResources(10, 20, 30).build(),
+    } as unknown as rpc.Api.SimulateTransactionResponse;
+
+    it("simulates the exact envelope when no simulation is supplied", async () => {
+      let simulated: Transaction | undefined;
+      const server = {
+        simulateTransaction: async (transaction: Transaction) => {
+          simulated = transaction;
+          return { ...simulation, minResourceFee: "2000" };
+        },
+      } as unknown as rpc.Server;
+      const checker = new CostPreChecker({
+        interceptor: fakeInterceptor(admissible(0n)),
+        networkPassphrase: NETWORK_PASSPHRASE,
+        server,
+      });
+      const decision = await checker.checkTransaction(TRANSACTION);
+      assert.equal(simulated, TRANSACTION);
+      assert.equal(decision.kind, "within_budget");
+      assert.equal(decision.resourceFeeStroops, 2_000n);
+      assert.equal(decision.inclusionFeeStroops, 100n);
+      assert.equal(decision.totalFeeStroops, 2_100n);
+      assert.equal(decision.provenance?.source, "transaction");
+      assert.equal(decision.provenance?.ledger, 512_345);
+      assert.equal(decision.breakdown?.storageEntries, 0);
+    });
+
+    it("uses a supplied simulation and applies the per-transaction ceiling", async () => {
+      const checker = new CostPreChecker({
+        interceptor: fakeInterceptor(admissible(0n)),
+        networkPassphrase: NETWORK_PASSPHRASE,
+      });
+      const options: CostTransactionCheckOptions = {
+        simulation: { ...simulation, minResourceFee: "2000" },
+        maxFeeStroops: "2000",
+      };
+      const decision = await checker.checkTransaction(TRANSACTION, options);
+      assert.equal(decision.kind, "over_budget");
+      assert.equal(decision.feeCeilingStroops, 2_000n);
+      assert.equal(decision.totalFeeStroops, 2_100n);
+      assert.equal(decision.inclusionFeeStroops, 100n);
+      assert.deepEqual(decision.provenance, { ledger: 512_345, source: "transaction" });
+    });
+
+    it("rejects a mismatched passphrase before simulating", async () => {
+      let simulations = 0;
+      const checker = new CostPreChecker({
+        interceptor: fakeInterceptor(admissible(0n)),
+        networkPassphrase: "Public Global Stellar Network ; September 2015",
+        server: {
+          simulateTransaction: async () => {
+            simulations += 1;
+            return { ...simulation, minResourceFee: "2000" };
+          },
+        } as unknown as rpc.Server,
+      });
+      await assert.rejects(
+        checker.checkTransaction(TRANSACTION),
+        (error: unknown) =>
+          error instanceof InvalidInputError && error.field === "transaction.networkPassphrase",
+      );
+      assert.equal(simulations, 0);
+    });
+
+    it("fails closed when the transaction simulation is unsuccessful", async () => {
+      const checker = new CostPreChecker({
+        interceptor: fakeInterceptor(admissible(0n)),
+        networkPassphrase: NETWORK_PASSPHRASE,
+      });
+      const decision = await checker.checkTransaction(TRANSACTION, {
+        simulation: {
+          error: "simulation failed",
+        } as unknown as rpc.Api.SimulateTransactionResponse,
+      });
+      assert.equal(decision.kind, "undetermined");
+      assert.equal(decision.allowed, false);
+      assert.deepEqual(decision.provenance, { ledger: null, source: "transaction" });
+    });
   });
 
   it("renders the exact edge values the money rule is about", () => {
@@ -1275,6 +1494,7 @@ describe("feeSource: rpc inclusion-fee quotes (issue #445)", () => {
       feeSource: "rpc",
       percentile: "p90",
       feeStatsLedger: 777,
+      source: "call",
     });
   });
 
@@ -1320,6 +1540,7 @@ describe("feeSource: rpc inclusion-fee quotes (issue #445)", () => {
       feeSource: "rpc",
       percentile: "p50",
       feeStatsLedger: 777,
+      source: "call",
     });
   });
 
@@ -1335,7 +1556,7 @@ describe("feeSource: rpc inclusion-fee quotes (issue #445)", () => {
     const decision = await checker.check(CALL);
     assert.equal(calls, 0);
     assert.equal(decision.inclusionFeeStroops, inclusion);
-    assert.deepEqual(decision.provenance, { ledger: 512_345 });
+    assert.deepEqual(decision.provenance, { ledger: 512_345, source: "call" });
   });
 
   it("does not price a refusal with a fee-stats RPC", async () => {

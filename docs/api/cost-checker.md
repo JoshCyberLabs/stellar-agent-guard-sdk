@@ -35,16 +35,16 @@ The SDK has no separate `CostPreCheckerOptions` type: the constructor takes `Cos
 | --- | --- | --- | --- |
 | `policySource` | `string \| PolicyConfig \| null` | the constructor's `policySource` / `policy` | Per-call policy source for `policyContext`. |
 | `policy` | `string \| PolicyConfig \| null` | as above | Alias for `policySource`. |
-| `maxFeeStroops` | `bigint` | the constructor's `maxFeeStroops` | Per-call ceiling, validated before the interceptor runs (`InvalidFeeCeilingError`). `0n` is kept, not treated as omission. |
+| `maxFeeStroops` | `bigint \| string` | the constructor's `maxFeeStroops` | Per-call ceiling, validated before simulation. `0n` / `"0"` is kept, not treated as omission. |
 | `windowSnapshot` | `WindowSpendSnapshot \| null` | the constructor's `windowSnapshot` | Per-call snapshot; an explicit `null` clears the configured one for this check. |
 | `signal` | `AbortSignal` | none | ⚠️ Forwarded to the interceptor: a fired signal yields an `undetermined` verdict and therefore an `undetermined` cost decision carrying `RpcTimeoutError`. |
 | `timeoutMs` | `number` | `DEFAULT_RPC_TIMEOUT_MS` (30 000 ms) per RPC call | ⚠️ A fired timeout is reported exactly like an abort, never as `within_budget`. `0` disables it. |
 
-Malformed ceilings are rejected before the interceptor runs, so a bad budget policy cannot spend an RPC call or be hidden behind a guard verdict. `InvalidFeeCeilingError` extends `InvalidInputError` (itself a `TypeError`) and exposes `field`, `rule: "non_negative_bigint"` and the rejected `value`.
+Malformed ceilings are rejected before the interceptor runs, so a bad budget policy cannot spend an RPC call or be hidden behind a guard verdict. `InvalidFeeCeilingError` remains the error for legacy wrong-type and negative-bigint inputs. Malformed strings and values above u64 throw `InvalidInputError`; both expose the offending field and an actionable validation detail.
 
 ## Methods
 
-### `check(call: ContractCall, options?: { policySource?: string | PolicyConfig | null; maxFeeStroops?: bigint; windowSnapshot?: WindowSpendSnapshot | null }): Promise<CostPreCheckResult>`
+### `check(call: ContractCall, options?: { policySource?: string | PolicyConfig | null; maxFeeStroops?: bigint | string; windowSnapshot?: WindowSpendSnapshot | null }): Promise<CostPreCheckResult>`
 
 Returns `CostPreCheckResult` (`CostDecision`), a discriminated union:
 - `{ kind: "within_budget", allowed: true, totalFeeStroops, resourceFeeStroops, inclusionFeeStroops, footprintKeys, feeCeilingStroops, surplusStroops, headroomWarning, policyContext, provenance }`
@@ -115,9 +115,33 @@ const checker = new CostPreChecker({
   can move before submission, so a quote can still underpay. The fixed-fee
   default remains the offline, deterministic choice.
 
+### `checkTransaction(transaction, options?): Promise<CostDecision>`
+
+Prices an already-built Stellar SDK `Transaction` without rebuilding or
+modifying its envelope. Set `networkPassphrase` in `CostPreCheckConfig`; a
+mismatch is rejected with `InvalidInputError` before simulation. Pass
+`options.simulation` when the exact transaction has already been simulated;
+otherwise configure `server` and the checker simulates that envelope directly.
+An unsuccessful or unpriceable simulation returns a fail-closed
+`undetermined` decision. The total is the envelope's actual fee, with the
+simulated resource fee separated from the remainder as inclusion fee.
+Transaction quotes carry
+`provenance: { ledger: number | null, source: "transaction" }` (the ledger is
+null if the RPC response did not establish a usable sequence). Ordinary
+`check()` quotes retain the interceptor's call path and mark known-ledger
+provenance with `source: "call"`.
+
+```ts
+const decision = await checker.checkTransaction(transaction, {
+  simulation: alreadySimulatedResponse,
+  maxFeeStroops: "50000",
+});
+```
+
 ### Ledger Provenance (`provenance`)
 
-Priced decisions carry the ledger marker of the simulation that produced the quote:
+Priced decisions carry the ledger marker and input path of the simulation that
+produced the quote:
 
 ```ts
 provenance: { ledger: number | null } | null
